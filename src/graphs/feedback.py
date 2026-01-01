@@ -1,125 +1,119 @@
-"""Feedback LangGraph: run checkers, validators, and aggregators."""
+"""Feedback Graph V2: Orchestrates Micro-Agents for code feedback."""
 
-from __future__ import annotations
-
-from typing import Dict, List, TypedDict
-
+from typing import Dict, List, TypedDict, Any
+from langgraph.graph import START, END, StateGraph
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
-from langgraph.graph import END, START, StateGraph
 
+from .feedback_agents.state import FeedbackState
+from .feedback_agents.schemas import AgentOutput, AgentInput
+from .feedback_agents.aggregator import aggregate_feedback
+from .feedback_agents.validators.structure_validator import StructureValidator
 
-class CheckerResult(TypedDict):
-    exercise_id: str
-    subtopic_id: str
-    response: str
-    prompt_used: str
-    code_used: str
+# Agents
+from .feedback_agents.agents.flow_structure import FlowStructureAgent
+from .feedback_agents.agents.function_division import FunctionDivisionAgent
+from .feedback_agents.agents.programming_errors import ProgrammingErrorsAgent
+from .feedback_agents.agents.conventions import ConventionsAgent
+from .feedback_agents.agents.debug_tasks import DebugTasksAgent
 
+# Initialize Agents
+agents = [
+    FlowStructureAgent(),
+    FunctionDivisionAgent(),
+    ProgrammingErrorsAgent(),
+    ConventionsAgent(),
+    DebugTasksAgent()
+]
+validator = StructureValidator()
 
-class FeedbackState(TypedDict, total=False):
-    prompts_by_exercise: Dict[str, Dict[str, Dict]]
-    code_by_exercise: Dict[str, str]
-    checker_results: List[CheckerResult]
-    validated_results: List[CheckerResult]
-    aggregated_feedback: Dict[str, str]
+def make_agent_node(agent):
+    """Factory to create a graph node for an agent."""
+    def node_func(state: FeedbackState):
+        inp = {
+            "code": state["code"], 
+            "exercise_description": state["exercise_description"],
+            "previous_feedback": [], # simplified for now
+            "metadata": {}
+        }
+        agent_input = AgentInput(**inp)
+        
+        output = agent.invoke(agent_input)
+        return {"results": output}
+    return node_func
 
-
-def _translate_to_hebrew(text: str) -> str:
-    """Translate a response to Hebrew; fall back to original on failure."""
-    if not text.strip():
-        return text
-    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    system = (
-        "Translate the following feedback to Hebrew. Preserve technical terms and any "
-        "explicit PASS/FAIL wording."
-    )
-    messages = [SystemMessage(content=system), HumanMessage(content=text)]
-    try:
-        return model.invoke(messages).content
-    except Exception:
-        return text
-
-
-def run_checkers(state: FeedbackState) -> FeedbackState:
-    """Invoke checker prompts per exercise/subtopic against the student code."""
-    prompts = state.get("prompts_by_exercise") or {}
-    code_map = state.get("code_by_exercise") or {}
-    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-    results: List[CheckerResult] = []
-    for exercise_id, subtopics in prompts.items():
-        code = code_map.get(exercise_id, "")
-        for subtopic_id, prompt in subtopics.items():
-            system = prompt.get("checker_prompt", "")
-            messages = [SystemMessage(content=system), HumanMessage(content=code)]
-            response = model.invoke(messages).content
-            results.append(
-                CheckerResult(
-                    exercise_id=exercise_id,
-                    subtopic_id=subtopic_id,
-                    response=response,
-                    prompt_used=system,
-                    code_used=code,
-                )
-            )
-
-    state["checker_results"] = results
-    return state
-
-
-def validate_results(state: FeedbackState) -> FeedbackState:
-    """Lightweight validator that retries once if PASS/FAIL is missing."""
-    validated: List[CheckerResult] = []
-    for result in state.get("checker_results", []):
-        # Minimal validator: ensure response is non-empty and mentions PASS/FAIL or equivalent.
-        text = (result.get("response") or "").strip().lower()
-        if not text or ("pass" not in text and "fail" not in text):
-            # Re-run the checker once if validation fails.
-            prompt = result["prompt_used"]
-            code = result["code_used"]
-            model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-            messages = [SystemMessage(content=prompt), HumanMessage(content=code)]
-            rerun = model.invoke(messages).content
-            result["response"] = rerun
-        # Always translate the final response to Hebrew.
-        result["response"] = _translate_to_hebrew(result["response"])
-        validated.append(result)
-
-    state["validated_results"] = validated
-    return state
-
-
-def aggregate_feedback(state: FeedbackState) -> FeedbackState:
-    """מאגד את פלט המאמתים למשוב פר תרגיל (בעברית)."""
-    aggregated: Dict[str, List[str]] = {}
-    for result in state.get("validated_results", []):
-        ex = result["exercise_id"]
-        aggregated.setdefault(ex, []).append(
-            f"- [{result['subtopic_id']}] {result['response']}"
-        )
-
-    state["aggregated_feedback"] = {
-        ex: f"משוב עבור תרגיל {ex}:\n" + "\n".join(lines)
-        for ex, lines in aggregated.items()
-    }
-    return state
-
+def route_to_agents(state: FeedbackState):
+    """Determine which agents to run based on the rubric configuration."""
+    config = state.get("rubric_config", {})
+    exercise_type = config.get("type", "regular")
+    
+    # Map subtopic IDs to agent node names
+    # Note: rubric uses IDs like 'flow_structure', we map to 'agent_flow_&_structure_agent' -> sanitized
+    # Let's verify the node naming convention used below:
+    # node_name = f"agent_{agent.name.replace(' ', '_').lower()}"
+    # Flow & Structure Agent -> agent_flow_&_structure_agent
+    
+    # It allows returning a list of nodes to run in parallel
+    next_nodes = []
+    
+    if exercise_type == 'debug':
+        # Debug exercises only need the DebugTasksAgent
+        next_nodes.append("agent_debug_tasks_agent")
+        
+    else:
+        # Regular exercises: look at subtopics
+        subtopics = config.get("subtopics", [])
+        
+        # Mapping from rubric subtopic ID to agent node name
+        # We need to ensure we match the keys in rubric.yaml
+        topic_map = {
+            "flow_structure": "agent_flow_&_structure_agent",
+            "function_decomposition": "agent_function_division_agent",
+            "programming_errors": "agent_programming_errors_agent",
+            "conventions_docs": "agent_conventions_&_documentation_agent"
+        }
+        
+        for sub in subtopics:
+            sid = sub.get("id")
+            if sid in topic_map:
+                next_nodes.append(topic_map[sid])
+                
+    # Fallback: if no nodes selected (e.g. config missing), run all or fail safe?
+    # For now, if empty, go straight to aggregator (effectively Check-Fail)
+    if not next_nodes:
+        return "aggregator"
+        
+    return next_nodes
 
 def build_feedback_graph() -> StateGraph:
     workflow = StateGraph(FeedbackState)
-    workflow.add_node("run_checkers", run_checkers)
-    workflow.add_node("validate_results", validate_results)
-    workflow.add_node("aggregate_feedback", aggregate_feedback)
-
-    workflow.add_edge(START, "run_checkers")
-    workflow.add_edge("run_checkers", "validate_results")
-    workflow.add_edge("validate_results", "aggregate_feedback")
-    workflow.add_edge("aggregate_feedback", END)
-
+    
+    # Register all agent nodes
+    for agent in agents:
+        node_name = f"agent_{agent.name.replace(' ', '_').lower()}"
+        workflow.add_node(node_name, make_agent_node(agent))
+        # All agents go to aggregator after finishing
+        workflow.add_edge(node_name, "aggregator")
+        
+    workflow.add_node("aggregator", aggregate_feedback)
+    
+    # Conditional start
+    # We need to list all possible destinations for the conditional edge
+    destinations = [
+       f"agent_{agent.name.replace(' ', '_').lower()}" for agent in agents
+    ] + ["aggregator"]
+    
+    workflow.add_conditional_edges(
+        START,
+        route_to_agents,
+        destinations
+    )
+    
+    workflow.add_edge("aggregator", END)
+    
     return workflow
-
 
 feedback_graph = build_feedback_graph().compile()
 
 __all__ = ["feedback_graph", "build_feedback_graph"]
+
