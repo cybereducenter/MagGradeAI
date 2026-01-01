@@ -121,14 +121,48 @@ Builds checker prompts per exercise:
 - Input: `examples/preprocessing_input.json` (rubric path, reference solutions, debug exercises).
 - Output: `prompts_by_exercise` mapping with 4 prompts per regular exercise and 1 prompt per debug exercise that lists required fixes. The script omits intermediate fields from the saved JSON.
 
-## Feedback Graph
+## Developer Guide: Micro-Agent Architecture
 
-Consumes the preprocessing output plus student code to produce final feedback:
+The feedback system (`src/graphs/feedback.py`) uses a modular Micro-Agent architecture tailored to the exercise rubric.
 
-- Check runners: apply each prompt’s `checker_prompt` to the student code.
-- Validators: retry once if the checker output lacks a clear pass/fail.
-- Aggregator: combines validated results into per-exercise feedback strings.
-- LangSmith tracing is enabled by default (`LANGCHAIN_TRACING_V2=true`).
+### 1. Architecture Components
+
+- **Orchestrator (`feedback.py`)**: The central LangGraph workflow. It does NOT run all agents blindly. Instead, it uses **Conditional Edges** to route execution.
+- **Micro-Agents**: Specialized agents (e.g., `FlowStructureAgent`, `ProgrammingErrorsAgent`) that inherit from `BaseAgent`. They output strict JSON.
+- **State (`FeedbackState`)**: Holds the code, description, and crucially, the `rubric_config` for the specific exercise.
+- **Aggregator**: Collects all agent outputs into a final unified report.
+
+### 2. The Conditional Edge Process (Dynamic Routing)
+
+The core innovation is the dynamic routing at the start of the graph:
+
+1.  **Input Configuration**: When the graph starts, it receives a `rubric_config` object (loaded from `rubrics/rubric.yaml`).
+2.  **`route_to_agents` Function**:
+    - This function inspects `rubric_config['type']`.
+    - **Debug Exercises**: Routes only to `DebugTasksAgent`.
+    - **Regular Exercises**: Iterates through `rubric_config['subtopics']` and routes **only** to the corresponding agents (e.g., if "Flow" is listed, `FlowStructureAgent` is activated).
+3.  **Parallel Execution**: The selected agents run in parallel.
+4.  **Aggregation**: All results are gathered by the `aggregator` node.
+
+**Code Reference:**
+```python
+# src/graphs/feedback.py
+
+def route_to_agents(state: FeedbackState):
+    config = state.get("rubric_config", {})
+    # ... logic to select next_nodes based on config ...
+    return next_nodes
+
+workflow.add_conditional_edges(START, route_to_agents, destinations)
+```
+
+### 3. Adding a New Agent
+
+1. Creates a new class in `src/graphs/feedback_agents/agents/` inheriting from `BaseAgent`.
+2. Define its `role_description` and `get_system_prompt`.
+3. Register it in `src/graphs/feedback.py`:
+    - Add to `agents` list.
+    - Add mapping logic in `route_to_agents`.
 
 ## Rubric Format
 
